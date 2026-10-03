@@ -1,0 +1,9 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Generated at runtime with the selected start URL
+_start.html
+
+# Editor-local configuration
+.vscode/
