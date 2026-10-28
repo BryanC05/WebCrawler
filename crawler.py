@@ -187,8 +187,14 @@ def main():
     if args.user_agent:
         UA = args.user_agent
 
+    DEFAULT_START = "https://en.wikipedia.org/wiki/Spider"
     index_path = os.path.join(HERE, "index.html")
-    html = open(index_path, encoding="utf-8").read().replace("__START_URL__", args.start)
+    raw_html = open(index_path, encoding="utf-8").read()
+    if "__START_URL__" in raw_html:
+        html = raw_html.replace("__START_URL__", args.start)
+    else:
+        # replace default URL if a custom start URL was specified
+        html = raw_html.replace(DEFAULT_START, args.start) if args.start != DEFAULT_START else raw_html
     # pass config to frontend
     cfg = f"<script>window.WCRAWLER_CFG={{consume:{'false' if args.no_consume else 'true'}}};</script>"
     if "<head>" in html:
