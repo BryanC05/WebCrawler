@@ -1,4 +1,4 @@
-﻿# WebCrawler
+# WebCrawler
 
 WebCrawler turns a live webpage into a small interactive scene. It serves a target page through a local proxy, draws a wandering spider over it, and reveals floating labels when the spider touches links, images, or short numeric values.
 
