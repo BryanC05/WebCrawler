@@ -1,13 +1,15 @@
 """
-WebCrawler â€” a spider crawls over a real webpage; when its leg tips touch
+WebCrawler — a spider crawls over a real webpage; when its leg tips touch
 links/elements, their text pops out as floating labels (inspired by @rybinfx).
 
 Usage:
     python crawler.py [start_url] [--port 8000]
+    python crawler.py [start_url] --port 8080 --timeout 20 --user-agent "..."
 
 Then open http://localhost:8000
 """
 import argparse
+import gzip
 import os
 import re
 import ssl
@@ -16,8 +18,8 @@ import urllib.parse
 import urllib.request
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
-UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"}
+DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # Some Windows trust stores ship expired roots; verify first, fall back if needed.
@@ -28,9 +30,17 @@ try:
 except ImportError:
     pass
 
+UA = DEFAULT_UA
+TIMEOUT = 15
 
-def fetch_html(url, timeout=15):
-    req = urllib.request.Request(url, headers=UA)
+
+def fetch_html(url, timeout=None, user_agent=None):
+    if timeout is None:
+        timeout = TIMEOUT
+    if user_agent is None:
+        user_agent = UA
+    headers = {"User-Agent": user_agent, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Accept-Encoding": "gzip, deflate"}
+    req = urllib.request.Request(url, headers=headers)
     try:
         resp = urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX)
     except urllib.error.URLError as e:
@@ -40,26 +50,62 @@ def fetch_html(url, timeout=15):
         else:
             raise
     ctype = resp.headers.get("Content-Type", "")
-    if "html" not in ctype:
-        raise ValueError(f"not html: {ctype}")
+    if "html" not in ctype and "text/" not in ctype:
+        # be lenient for some servers
+        pass
     charset = "utf-8"
     m = re.search(r"charset=([\w-]+)", ctype)
     if m:
         charset = m.group(1)
-    return resp.read().decode(charset, "ignore")
+    data = resp.read()
+    if resp.headers.get("Content-Encoding") == "gzip":
+        try:
+            data = gzip.decompress(data)
+        except Exception:
+            pass
+    # try to detect charset from meta if still questionable
+    try:
+        text = data.decode(charset, "ignore")
+    except Exception:
+        text = data.decode("utf-8", "ignore")
+    return text
 
 
 def absolutize(html, base):
     """Rewrite relative href/src against the page URL."""
     def fix(match):
         attr, quote, value = match.group(1), match.group(2), match.group(3)
-        if value.startswith(("data:", "javascript:", "#", "mailto:", "http")):
+        if value.startswith(("data:", "javascript:", "#", "mailto:", "tel:", "http")):
             return match.group(0)
         try:
             return f'{attr}={quote}{urllib.parse.urljoin(base, value)}{quote}'
         except Exception:
             return match.group(0)
-    return re.sub(r"(href|src)=(\"|')([^\"']+)", fix, html)
+    html = re.sub(r"(href|src)=(\"|')([^\"']+)", fix, html)
+    # also handle srcset
+    def fix_srcset(m):
+        attr, quote, content = m.group(1), m.group(2), m.group(3)
+        parts = []
+        for p in content.split(','):
+            p2 = p.strip()
+            if not p2:
+                continue
+            # first token is url
+            tokens = p2.split()
+            if not tokens:
+                continue
+            url = tokens[0]
+            rest = ' ' + ' '.join(tokens[1:]) if len(tokens) > 1 else ''
+            if url.startswith(("data:", "javascript:", "#", "mailto:", "http")):
+                parts.append(p2)
+            else:
+                try:
+                    parts.append(urllib.parse.urljoin(base, url) + rest)
+                except Exception:
+                    parts.append(p2)
+        return f'{attr}={quote}{", ".join(parts)}{quote}'
+    html = re.sub(r"(srcset)=(\"|')([^\"']+)", fix_srcset, html)
+    return html
 
 
 def clean(html, base):
@@ -70,6 +116,8 @@ def clean(html, base):
     html = re.sub(r"<meta[^>]+http-equiv=[\"']?refresh[^>]*>", "", html, flags=re.I)
     html = re.sub(r'(?i)integrity\s*=\s*("|\')[^"\']*\1\s*', "", html)
     html = re.sub(r'(?i)nonce\s*=\s*("|\')[^"\']*\1\s*', "", html)
+    # remove frame blocking meta
+    html = re.sub(r'<meta[^>]+http-equiv=["\']X-Frame-Options["\'][^>]*>', "", html, flags=re.I)
     html = absolutize(html, base)
     inject = ("<base target='_blank'>"
               "<style>html{scrollbar-width:thin}::selection{background:#0f05}</style>")
@@ -81,6 +129,18 @@ def clean(html, base):
 class CrawlerHandler(SimpleHTTPRequestHandler):
     def log_message(self, *a):
         pass
+
+    def end_headers(self):
+        # Prevent frame blocking
+        try:
+            self.send_header("X-Frame-Options", "ALLOWALL")
+        except Exception:
+            pass
+        try:
+            self.send_header("Content-Security-Policy", "frame-ancestors *;")
+        except Exception:
+            pass
+        super().end_headers()
 
     def translate_path(self, path):
         # serve the URL-substituted index as the homepage
@@ -114,13 +174,25 @@ class CrawlerHandler(SimpleHTTPRequestHandler):
 
 
 def main():
+    global UA, TIMEOUT
     ap = argparse.ArgumentParser(description="Spider-crawls a real webpage and pops its text")
     ap.add_argument("start", nargs="?", default="https://en.wikipedia.org/wiki/Spider")
     ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--timeout", type=int, default=15)
+    ap.add_argument("--user-agent", type=str, default=None)
+    ap.add_argument("--no-consume", action="store_true", help="Disable consuming elements (label only)")
     args = ap.parse_args()
+
+    TIMEOUT = args.timeout
+    if args.user_agent:
+        UA = args.user_agent
 
     index_path = os.path.join(HERE, "index.html")
     html = open(index_path, encoding="utf-8").read().replace("__START_URL__", args.start)
+    # pass config to frontend
+    cfg = f"<script>window.WCRAWLER_CFG={{consume:{'false' if args.no_consume else 'true'}}};</script>"
+    if "<head>" in html:
+        html = html.replace("<head>", "<head>" + cfg, 1)
     open(os.path.join(HERE, "_start.html"), "w", encoding="utf-8").write(html)
 
     srv = ThreadingHTTPServer(("0.0.0.0", args.port), CrawlerHandler)
